@@ -1,0 +1,12 @@
+2026-10-20T14:56:18.442272-03:00 urubu sshd-session[13009]: Accepted password for roubante-do-pix from 192.168.122.236 port 37160 ssh2
+2026-10-20T15:01:00.000000-03:00 urubu sshd-session[14000]: Failed password for invalid user admin from 203.0.113.50 port 50000 ssh2
+2026-10-20T15:01:05.000000-03:00 urubu sshd-session[14001]: Invalid user oracle from 203.0.113.50 port 50001
+2026-10-20T15:01:10.000000-03:00 urubu sshd-session[14002]: Failed publickey for root from 2001:db8::10 port 50002 ssh2
+2026-10-20T15:01:15.000000-03:00 urubu sshd-session[14003]: maximum authentication attempts exceeded for invalid user test from 198.51.100.8 port 50003 ssh2 [preauth]
+2026-10-20T15:01:20.000000-03:00 urubu sshd-session[14004]: Connection closed by 198.51.100.9 port 50004 [preauth]
+2026-10-20T15:01:25.000000-03:00 urubu sshd-session[14005]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=198.51.100.10 user=alice
+Oct 20 14:56:18 urubu sshd[1234]: Failed password for bob from 198.51.100.7 port 22 ssh2
+2026-10-20T15:02:00.000000-03:00 urubu sudo: pam_unix(sudo:session): session opened for user root(uid=0) by roubante-do-pix(uid=1000)
+2026-10-20T15:02:01.000000-03:00 urubu CRON[15000]: pam_unix(cron:session): session opened for user root(uid=0) by root(uid=0)
+not a syslog line
+2026-10-20T15:02:02.000000-03:00 urubu dbus-daemon[1234]: [system] Failed to activate service 'org.bluez'
