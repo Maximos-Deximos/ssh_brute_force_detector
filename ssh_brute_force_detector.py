@@ -4,11 +4,14 @@ import argparse
 import datetime as dt
 import json
 import logging
+import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, TextIO
+from typing import Any, BinaryIO, Callable, Iterable
 
 LOGGER = logging.getLogger("ssh_brute_force_detector")
 
@@ -224,6 +227,234 @@ class JsonlEventLogger:
             handle.write(line + "\n")
             handle.flush()
 
+
+@dataclass
+class MonitorState:
+    path: str
+    inode: int
+    device: int
+    offset: int
+    last_timestamp: str | None = None
+    updated_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> MonitorState:
+        return cls(
+            path=str(value["path"]),
+            inode=int(value["inode"]),
+            device=int(value["device"]),
+            offset=max(0, int(value["offset"])),
+            last_timestamp=value.get("last_timestamp"),
+            updated_at=value.get("updated_at"),
+        )
+
+
+class MonitorStateStore:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> MonitorState | None:
+        if not self.path.exists():
+            return None
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            return MonitorState.from_dict(value)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            LOGGER.warning("Ignoring invalid monitor state at %s", self.path)
+            return None
+
+    def save(self, state: MonitorState) -> None:
+        state.updated_at = dt.datetime.now().astimezone().isoformat()
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        payload = json.dumps(state.to_dict(), sort_keys=True)
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self.path)
+
+
+class LogMonitor:
+    def __init__(
+        self,
+        path: str | Path,
+        parser: LogParser,
+        state_store: MonitorStateStore,
+        on_event: Callable[[AuthEvent], None],
+        from_end: bool = False,
+        poll_interval: float = 1.0,
+        read_chunk_size: int = 65536,
+        max_partial_bytes: int = 1048576,
+    ) -> None:
+        self.path = Path(path)
+        self.parser = parser
+        self.state_store = state_store
+        self.on_event = on_event
+        self.from_end = from_end
+        self.poll_interval = max(0.05, poll_interval)
+        self.read_chunk_size = max(1, read_chunk_size)
+        self.max_partial_bytes = max(4096, max_partial_bytes)
+        self._handle: BinaryIO | None = None
+        self._buffer = bytearray()
+        self._processed_offset = 0
+        self._read_position = 0
+        self._identity: tuple[int, int] | None = None
+        self._last_timestamp: str | None = None
+        self._started = False
+
+    def start(self) -> None:
+        stat = self.path.stat()
+        saved = self.state_store.load()
+        offset = 0
+        if (
+            saved is not None
+            and saved.path == str(self.path)
+            and saved.inode == stat.st_ino
+            and saved.device == stat.st_dev
+            and saved.offset <= stat.st_size
+        ):
+            offset = saved.offset
+            self._last_timestamp = saved.last_timestamp
+            LOGGER.info("Resuming %s at byte %d", self.path, offset)
+        elif saved is not None:
+            LOGGER.warning("Log rotated while stopped; starting %s at byte 0", self.path)
+        elif self.from_end:
+            offset = stat.st_size
+
+        self._open_at(offset)
+        self._started = True
+        self._save_state(force=True)
+
+    def _open(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+        self._handle = self.path.open("rb", buffering=0)
+        stat = os.fstat(self._handle.fileno())
+        self._identity = (stat.st_dev, stat.st_ino)
+
+    def _open_at(self, offset: int) -> None:
+        self._open()
+        assert self._handle is not None
+        self._handle.seek(offset)
+        self._processed_offset = offset
+        self._read_position = offset
+        self._buffer.clear()
+
+    def _save_state(self, force: bool = False) -> None:
+        if self._identity is None:
+            return
+        if not force and self._handle is None:
+            return
+        state = MonitorState(
+            path=str(self.path),
+            inode=self._identity[1],
+            device=self._identity[0],
+            offset=self._processed_offset,
+            last_timestamp=self._last_timestamp,
+        )
+        self.state_store.save(state)
+
+    def _process_line(self, raw: bytes) -> None:
+        text = raw.decode("utf-8", errors="replace")
+        if not text.strip():
+            return
+        event = self.parser.parse_line(text)
+        if event is None:
+            return
+        self._last_timestamp = event.timestamp.isoformat()
+        try:
+            self.on_event(event)
+        except Exception:
+            LOGGER.exception("Event handler failed for a parsed SSH event")
+
+    def _flush_partial(self) -> None:
+        if not self._buffer:
+            return
+        raw = bytes(self._buffer)
+        self._buffer.clear()
+        self._processed_offset += len(raw)
+        self._process_line(raw)
+
+    def _drain(self) -> bool:
+        if self._handle is None:
+            return False
+        changed = False
+        while True:
+            data = self._handle.read(self.read_chunk_size)
+            if not data:
+                break
+            self._buffer.extend(data)
+            self._read_position = self._handle.tell()
+            changed = True
+            while True:
+                newline = self._buffer.find(b"\n")
+                if newline < 0:
+                    break
+                raw = bytes(self._buffer[:newline])
+                del self._buffer[: newline + 1]
+                line_size = newline + 1
+                self._process_line(raw)
+                self._processed_offset += line_size
+            if len(self._buffer) > self.max_partial_bytes:
+                LOGGER.warning("Discarding oversized partial log line from %s", self.path)
+                self._buffer.clear()
+                self._processed_offset = self._read_position
+        return changed
+
+    def _handle_rotation(self) -> bool:
+        self._drain()
+        self._flush_partial()
+        self._save_state(force=True)
+        LOGGER.info("Log rotation detected for %s", self.path)
+        self._open_at(0)
+        return True
+
+    def poll_once(self) -> bool:
+        if not self._started:
+            self.start()
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return False
+        if self._identity != (stat.st_dev, stat.st_ino):
+            changed = self._handle_rotation()
+        else:
+            if self._handle is None:
+                self._open_at(self._processed_offset)
+            if stat.st_size < self._read_position:
+                LOGGER.info("Log truncation detected for %s", self.path)
+                if self._handle is not None:
+                    self._handle.close()
+                self._open_at(0)
+                changed = True
+            else:
+                changed = False
+        changed = self._drain() or changed
+        if changed:
+            self._save_state()
+        return changed
+
+    def run_forever(self, tick: Callable[[], None] | None = None) -> None:
+        if not self._started:
+            self.start()
+        while True:
+            self.poll_once()
+            if tick is not None:
+                tick()
+            time.sleep(self.poll_interval)
+
+    def stop(self) -> None:
+        if self._handle is not None:
+            self._drain()
+            self._flush_partial()
+            self._save_state(force=True)
+            self._handle.close()
+            self._handle = None
+        self._started = False
 
 def iter_log_lines(path: str | Path) -> Iterable[str]:
     source = Path(path)
