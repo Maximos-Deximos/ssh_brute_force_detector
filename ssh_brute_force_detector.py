@@ -8,6 +8,8 @@ import os
 import re
 import sys
 import time
+from collections import deque
+from dataclasses import asdict, dataclass, field
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, TextIO
@@ -215,6 +217,131 @@ class LogParser:
             raw=stripped,
         )
 
+@dataclass(frozen=True)
+class DetectionConfig:
+    window_seconds: int = 600
+    alert_threshold: int = 5
+    rate_limit_threshold: int = 8
+    block_threshold: int = 12
+    reset_on_success: bool = True
+
+    def __post_init__(self) -> None:
+        if self.window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        if min(self.alert_threshold, self.rate_limit_threshold, self.block_threshold) <= 0:
+            raise ValueError("detection thresholds must be positive")
+        if not (
+            self.alert_threshold
+            <= self.rate_limit_threshold
+            <= self.block_threshold
+        ):
+            raise ValueError("thresholds must be ordered alert <= rate_limit <= block")
+
+
+@dataclass(frozen=True)
+class Detection:
+    ip: str
+    failure_count: int
+    window_seconds: int
+    first_failure: dt.datetime
+    last_failure: dt.datetime
+    usernames: tuple[str, ...]
+    stage: str
+    is_new_attack: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ip": self.ip,
+            "failure_count": self.failure_count,
+            "window_seconds": self.window_seconds,
+            "first_failure": self.first_failure.isoformat(),
+            "last_failure": self.last_failure.isoformat(),
+            "usernames": list(self.usernames),
+            "stage": self.stage,
+            "is_new_attack": self.is_new_attack,
+        }
+
+
+@dataclass
+class _IPWindow:
+    failures: deque[tuple[dt.datetime, str | None]] = field(default_factory=deque)
+    last_milestone: int = 0
+    ever_emitted: bool = False
+
+
+class DetectionEngine:
+    def __init__(self, config: DetectionConfig | None = None) -> None:
+        self.config = config or DetectionConfig()
+        self._windows: dict[str, _IPWindow] = {}
+
+    def _prune(self, state: _IPWindow, reference: dt.datetime) -> None:
+        cutoff = reference - dt.timedelta(seconds=self.config.window_seconds)
+        while state.failures and state.failures[0][0] < cutoff:
+            state.failures.popleft()
+
+    def _stage_for(self, count: int) -> str:
+        if count >= self.config.block_threshold:
+            return "block"
+        if count >= self.config.rate_limit_threshold:
+            return "rate_limit"
+        return "alert"
+
+    def record(self, event: AuthEvent) -> Detection | None:
+        if event.source_ip is None:
+            return None
+        if event.status == "success":
+            if self.config.reset_on_success:
+                self._windows.pop(event.source_ip, None)
+            return None
+        if event.status != "failure":
+            return None
+
+        state = self._windows.setdefault(event.source_ip, _IPWindow())
+        self._prune(state, event.timestamp)
+        state.failures.append((event.timestamp, event.username))
+        count = len(state.failures)
+        if count < self.config.alert_threshold:
+            state.last_milestone = 0
+            state.ever_emitted = False
+            return None
+
+        milestone = max(
+            threshold
+            for threshold in (
+                self.config.alert_threshold,
+                self.config.rate_limit_threshold,
+                self.config.block_threshold,
+            )
+            if count >= threshold
+        )
+        if milestone <= state.last_milestone:
+            return None
+
+        is_new_attack = not state.ever_emitted
+        state.last_milestone = milestone
+        state.ever_emitted = True
+        first_failure = state.failures[0][0]
+        usernames = tuple(
+            sorted({username for _, username in state.failures if username})
+        )
+        return Detection(
+            ip=event.source_ip,
+            failure_count=count,
+            window_seconds=self.config.window_seconds,
+            first_failure=first_failure,
+            last_failure=event.timestamp,
+            usernames=usernames,
+            stage=self._stage_for(milestone),
+            is_new_attack=is_new_attack,
+        )
+
+    def current_count(self, ip: str, reference: dt.datetime | None = None) -> int:
+        state = self._windows.get(ip)
+        if state is None:
+            return 0
+        if reference is not None:
+            self._prune(state, reference)
+        return len(state.failures)
 
 class JsonlEventLogger:
     def __init__(self, path: str | Path) -> None:
