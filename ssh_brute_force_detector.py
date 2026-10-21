@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import ipaddress
 import logging
 import os
 import re
 import sys
+import socket
+import sqlite3
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -342,6 +345,253 @@ class DetectionEngine:
         if reference is not None:
             self._prune(state, reference)
         return len(state.failures)
+
+def _normalize_ip(value: str) -> str:
+    return str(ipaddress.ip_address(value.strip().split("%", 1)[0]))
+
+
+def _normalize_network(value: str) -> str:
+    return str(ipaddress.ip_network(value.strip().split("%", 1)[0], strict=False))
+
+
+def _network_contains(network: str, ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(network, strict=False)
+    except ValueError:
+        return False
+
+
+def discover_local_ips() -> set[str]:
+    result = {"127.0.0.1", "::1"}
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            address = info[4][0]
+            if address:
+                result.add(_normalize_ip(address))
+    except (OSError, ValueError):
+        pass
+    for family, target in (
+        (socket.AF_INET, "8.8.8.8"),
+        (socket.AF_INET6, "2001:4860:4860::8888"),
+    ):
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                sock.connect((target, 80))
+                result.add(_normalize_ip(sock.getsockname()[0]))
+        except (OSError, ValueError):
+            pass
+    return result
+
+
+def discover_ssh_peers(environ: dict[str, str] | None = None) -> set[str]:
+    environment = environ if environ is not None else os.environ
+    result: set[str] = set()
+    for variable in ("SSH_CONNECTION", "SSH_CLIENT"):
+        parts = environment.get(variable, "").split()
+        if not parts:
+            continue
+        try:
+            result.add(_normalize_ip(parts[0]))
+        except ValueError:
+            continue
+    return result
+
+
+@dataclass(frozen=True)
+class ReputationConfig:
+    whitelist: tuple[str, ...] = (
+        "127.0.0.0/8",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+    )
+    blacklist: tuple[str, ...] = ()
+    admin_ips: tuple[str, ...] = ()
+    critical_ips: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for value in (
+            *self.whitelist,
+            *self.blacklist,
+            *self.admin_ips,
+            *self.critical_ips,
+        ):
+            _normalize_network(value)
+
+
+class ReputationStore:
+    def __init__(
+        self,
+        db_path: str | Path,
+        config: ReputationConfig | None = None,
+        local_ips: Iterable[str] | None = None,
+        environ: dict[str, str] | None = None,
+        discover_local: bool = True,
+    ) -> None:
+        self.config = config or ReputationConfig()
+        self.db_path = str(db_path)
+        if self.db_path != ":memory:":
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._connection = sqlite3.connect(self.db_path)
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reputation (
+                entry TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('good', 'bad')),
+                reason TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (entry, kind)
+            )
+            """
+        )
+        self._connection.commit()
+        self._good_networks = tuple(
+            _normalize_network(item) for item in self.config.whitelist
+        )
+        self._bad_networks = tuple(
+            _normalize_network(item) for item in self.config.blacklist
+        )
+        self._admin_ips = {_normalize_ip(item) for item in self.config.admin_ips}
+        self._critical_ips = {_normalize_ip(item) for item in self.config.critical_ips}
+        discovered = set(discover_ssh_peers(environ))
+        if local_ips is not None:
+            discovered.update(_normalize_ip(item) for item in local_ips)
+        elif discover_local:
+            discovered.update(discover_local_ips())
+        self._local_ips = discovered
+
+    def _rows(self, kind: str) -> list[sqlite3.Row]:
+        return list(
+            self._connection.execute(
+                "SELECT entry, kind, reason, source, created_at "
+                "FROM reputation WHERE kind = ? ORDER BY entry",
+                (kind,),
+            )
+        )
+
+    def is_whitelisted(self, ip: str) -> bool:
+        try:
+            normalized = _normalize_ip(ip)
+        except ValueError:
+            return True
+        if normalized in self._admin_ips or normalized in self._local_ips:
+            return True
+        if any(_network_contains(network, normalized) for network in self._good_networks):
+            return True
+        return any(
+            _network_contains(row["entry"], normalized) for row in self._rows("good")
+        )
+
+    def is_protected(self, ip: str) -> bool:
+        try:
+            address = ipaddress.ip_address(ip.strip().split("%", 1)[0])
+        except ValueError:
+            return True
+        if (
+            address.is_loopback
+            or address.is_unspecified
+            or address.is_multicast
+            or address.is_link_local
+        ):
+            return True
+        normalized = str(address)
+        return (
+            normalized in self._critical_ips
+            or self.is_whitelisted(normalized)
+        )
+
+    def is_blacklisted(self, ip: str) -> bool:
+        try:
+            normalized = _normalize_ip(ip)
+        except ValueError:
+            return False
+        if self.is_protected(normalized):
+            return False
+        if any(_network_contains(network, normalized) for network in self._bad_networks):
+            return True
+        return any(
+            _network_contains(row["entry"], normalized) for row in self._rows("bad")
+        )
+
+    def classify(self, ip: str) -> str:
+        try:
+            normalized = _normalize_ip(ip)
+        except ValueError:
+            return "protected"
+        if self.is_protected(normalized):
+            return "protected"
+        if self.is_blacklisted(normalized):
+            return "bad"
+        if self.is_whitelisted(normalized):
+            return "good"
+        return "unknown"
+
+    def add_good(self, value: str, reason: str = "", source: str = "manual") -> str:
+        entry = _normalize_network(value)
+        self._upsert(entry, "good", reason, source)
+        return entry
+
+    def add_bad(self, value: str, reason: str = "", source: str = "manual") -> bool:
+    
+        try:
+            entry = _normalize_network(value)
+        except ValueError:
+            return False
+        try:
+            sample_ip = str(next(ipaddress.ip_network(entry, strict=False).hosts()))
+        except StopIteration:
+            sample_ip = entry.split("/", 1)[0]
+        if self.is_protected(sample_ip):
+            return False
+        self._upsert(entry, "bad", reason, source)
+        return True
+
+    def remove_good(self, value: str) -> None:
+        self._delete(_normalize_network(value), "good")
+
+    def remove_bad(self, value: str) -> None:
+        self._delete(_normalize_network(value), "bad")
+
+    def _upsert(self, entry: str, kind: str, reason: str, source: str) -> None:
+        now = dt.datetime.now().astimezone().isoformat()
+        self._connection.execute(
+            """
+            INSERT INTO reputation (entry, kind, reason, source, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(entry, kind) DO UPDATE SET
+                reason = excluded.reason,
+                source = excluded.source,
+                created_at = excluded.created_at
+            """,
+            (entry, kind, reason, source, now),
+        )
+        self._connection.commit()
+
+    def _delete(self, entry: str, kind: str) -> None:
+        self._connection.execute(
+            "DELETE FROM reputation WHERE entry = ? AND kind = ?", (entry, kind)
+        )
+        self._connection.commit()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "good": [dict(row) for row in self._rows("good")],
+            "bad": [dict(row) for row in self._rows("bad")],
+            "protected": {
+                "admin_ips": sorted(self._admin_ips),
+                "local_ips": sorted(self._local_ips),
+                "critical_ips": sorted(self._critical_ips),
+            },
+            "config_whitelist": list(self._good_networks),
+            "config_blacklist": list(self._bad_networks),
+        }
+
+    def close(self) -> None:
+        self._connection.close()
 
 class JsonlEventLogger:
     def __init__(self, path: str | Path) -> None:
