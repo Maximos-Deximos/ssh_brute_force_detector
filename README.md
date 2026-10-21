@@ -7,7 +7,7 @@ with entries showing source IP, username attempted, and authentication status
 The ability to read log files and extract failed SSH login attempts, including source IP
 addresses and timestamps.
 
-A boats a brute force pattern detection by tracking failed login attempts per source IP over 
+A brute force pattern detection by tracking failed login attempts per source IP over 
 time windows (e.g., 5 failed attempts in 600 seconds indicates an attack). with configurable 
 thresholds for what constitutes an attack, distinguishing between user mistakes and actual brute
 force attacks.
