@@ -3,12 +3,20 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import ipaddress
 import logging
+import os
 import re
 import sys
+import socket
+import sqlite3
+import time
+from collections import deque
+from dataclasses import asdict, dataclass, field
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, TextIO
+from typing import Any, BinaryIO, Callable, Iterable
 
 LOGGER = logging.getLogger("ssh_brute_force_detector")
 
@@ -212,6 +220,378 @@ class LogParser:
             raw=stripped,
         )
 
+@dataclass(frozen=True)
+class DetectionConfig:
+    window_seconds: int = 600
+    alert_threshold: int = 5
+    rate_limit_threshold: int = 8
+    block_threshold: int = 12
+    reset_on_success: bool = True
+
+    def __post_init__(self) -> None:
+        if self.window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        if min(self.alert_threshold, self.rate_limit_threshold, self.block_threshold) <= 0:
+            raise ValueError("detection thresholds must be positive")
+        if not (
+            self.alert_threshold
+            <= self.rate_limit_threshold
+            <= self.block_threshold
+        ):
+            raise ValueError("thresholds must be ordered alert <= rate_limit <= block")
+
+
+@dataclass(frozen=True)
+class Detection:
+    ip: str
+    failure_count: int
+    window_seconds: int
+    first_failure: dt.datetime
+    last_failure: dt.datetime
+    usernames: tuple[str, ...]
+    stage: str
+    is_new_attack: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ip": self.ip,
+            "failure_count": self.failure_count,
+            "window_seconds": self.window_seconds,
+            "first_failure": self.first_failure.isoformat(),
+            "last_failure": self.last_failure.isoformat(),
+            "usernames": list(self.usernames),
+            "stage": self.stage,
+            "is_new_attack": self.is_new_attack,
+        }
+
+
+@dataclass
+class _IPWindow:
+    failures: deque[tuple[dt.datetime, str | None]] = field(default_factory=deque)
+    last_milestone: int = 0
+    ever_emitted: bool = False
+
+
+class DetectionEngine:
+    def __init__(self, config: DetectionConfig | None = None) -> None:
+        self.config = config or DetectionConfig()
+        self._windows: dict[str, _IPWindow] = {}
+
+    def _prune(self, state: _IPWindow, reference: dt.datetime) -> None:
+        cutoff = reference - dt.timedelta(seconds=self.config.window_seconds)
+        while state.failures and state.failures[0][0] < cutoff:
+            state.failures.popleft()
+
+    def _stage_for(self, count: int) -> str:
+        if count >= self.config.block_threshold:
+            return "block"
+        if count >= self.config.rate_limit_threshold:
+            return "rate_limit"
+        return "alert"
+
+    def record(self, event: AuthEvent) -> Detection | None:
+        if event.source_ip is None:
+            return None
+        if event.status == "success":
+            if self.config.reset_on_success:
+                self._windows.pop(event.source_ip, None)
+            return None
+        if event.status != "failure":
+            return None
+
+        state = self._windows.setdefault(event.source_ip, _IPWindow())
+        self._prune(state, event.timestamp)
+        state.failures.append((event.timestamp, event.username))
+        count = len(state.failures)
+        if count < self.config.alert_threshold:
+            state.last_milestone = 0
+            state.ever_emitted = False
+            return None
+
+        milestone = max(
+            threshold
+            for threshold in (
+                self.config.alert_threshold,
+                self.config.rate_limit_threshold,
+                self.config.block_threshold,
+            )
+            if count >= threshold
+        )
+        if milestone <= state.last_milestone:
+            return None
+
+        is_new_attack = not state.ever_emitted
+        state.last_milestone = milestone
+        state.ever_emitted = True
+        first_failure = state.failures[0][0]
+        usernames = tuple(
+            sorted({username for _, username in state.failures if username})
+        )
+        return Detection(
+            ip=event.source_ip,
+            failure_count=count,
+            window_seconds=self.config.window_seconds,
+            first_failure=first_failure,
+            last_failure=event.timestamp,
+            usernames=usernames,
+            stage=self._stage_for(milestone),
+            is_new_attack=is_new_attack,
+        )
+
+    def current_count(self, ip: str, reference: dt.datetime | None = None) -> int:
+        state = self._windows.get(ip)
+        if state is None:
+            return 0
+        if reference is not None:
+            self._prune(state, reference)
+        return len(state.failures)
+
+def _normalize_ip(value: str) -> str:
+    return str(ipaddress.ip_address(value.strip().split("%", 1)[0]))
+
+
+def _normalize_network(value: str) -> str:
+    return str(ipaddress.ip_network(value.strip().split("%", 1)[0], strict=False))
+
+
+def _network_contains(network: str, ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(network, strict=False)
+    except ValueError:
+        return False
+
+
+def discover_local_ips() -> set[str]:
+    result = {"127.0.0.1", "::1"}
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            address = info[4][0]
+            if address:
+                result.add(_normalize_ip(address))
+    except (OSError, ValueError):
+        pass
+    for family, target in (
+        (socket.AF_INET, "8.8.8.8"),
+        (socket.AF_INET6, "2001:4860:4860::8888"),
+    ):
+        try:
+            with socket.socket(family, socket.SOCK_DGRAM) as sock:
+                sock.connect((target, 80))
+                result.add(_normalize_ip(sock.getsockname()[0]))
+        except (OSError, ValueError):
+            pass
+    return result
+
+
+def discover_ssh_peers(environ: dict[str, str] | None = None) -> set[str]:
+    environment = environ if environ is not None else os.environ
+    result: set[str] = set()
+    for variable in ("SSH_CONNECTION", "SSH_CLIENT"):
+        parts = environment.get(variable, "").split()
+        if not parts:
+            continue
+        try:
+            result.add(_normalize_ip(parts[0]))
+        except ValueError:
+            continue
+    return result
+
+
+@dataclass(frozen=True)
+class ReputationConfig:
+    whitelist: tuple[str, ...] = (
+        "127.0.0.0/8",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+    )
+    blacklist: tuple[str, ...] = ()
+    admin_ips: tuple[str, ...] = ()
+    critical_ips: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for value in (
+            *self.whitelist,
+            *self.blacklist,
+            *self.admin_ips,
+            *self.critical_ips,
+        ):
+            _normalize_network(value)
+
+
+class ReputationStore:
+    def __init__(
+        self,
+        db_path: str | Path,
+        config: ReputationConfig | None = None,
+        local_ips: Iterable[str] | None = None,
+        environ: dict[str, str] | None = None,
+        discover_local: bool = True,
+    ) -> None:
+        self.config = config or ReputationConfig()
+        self.db_path = str(db_path)
+        if self.db_path != ":memory:":
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._connection = sqlite3.connect(self.db_path)
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reputation (
+                entry TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('good', 'bad')),
+                reason TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (entry, kind)
+            )
+            """
+        )
+        self._connection.commit()
+        self._good_networks = tuple(
+            _normalize_network(item) for item in self.config.whitelist
+        )
+        self._bad_networks = tuple(
+            _normalize_network(item) for item in self.config.blacklist
+        )
+        self._admin_ips = {_normalize_ip(item) for item in self.config.admin_ips}
+        self._critical_ips = {_normalize_ip(item) for item in self.config.critical_ips}
+        discovered = set(discover_ssh_peers(environ))
+        if local_ips is not None:
+            discovered.update(_normalize_ip(item) for item in local_ips)
+        elif discover_local:
+            discovered.update(discover_local_ips())
+        self._local_ips = discovered
+
+    def _rows(self, kind: str) -> list[sqlite3.Row]:
+        return list(
+            self._connection.execute(
+                "SELECT entry, kind, reason, source, created_at "
+                "FROM reputation WHERE kind = ? ORDER BY entry",
+                (kind,),
+            )
+        )
+
+    def is_whitelisted(self, ip: str) -> bool:
+        try:
+            normalized = _normalize_ip(ip)
+        except ValueError:
+            return True
+        if normalized in self._admin_ips or normalized in self._local_ips:
+            return True
+        if any(_network_contains(network, normalized) for network in self._good_networks):
+            return True
+        return any(
+            _network_contains(row["entry"], normalized) for row in self._rows("good")
+        )
+
+    def is_protected(self, ip: str) -> bool:
+        try:
+            address = ipaddress.ip_address(ip.strip().split("%", 1)[0])
+        except ValueError:
+            return True
+        if (
+            address.is_loopback
+            or address.is_unspecified
+            or address.is_multicast
+            or address.is_link_local
+        ):
+            return True
+        normalized = str(address)
+        return (
+            normalized in self._critical_ips
+            or self.is_whitelisted(normalized)
+        )
+
+    def is_blacklisted(self, ip: str) -> bool:
+        try:
+            normalized = _normalize_ip(ip)
+        except ValueError:
+            return False
+        if self.is_protected(normalized):
+            return False
+        if any(_network_contains(network, normalized) for network in self._bad_networks):
+            return True
+        return any(
+            _network_contains(row["entry"], normalized) for row in self._rows("bad")
+        )
+
+    def classify(self, ip: str) -> str:
+        try:
+            normalized = _normalize_ip(ip)
+        except ValueError:
+            return "protected"
+        if self.is_protected(normalized):
+            return "protected"
+        if self.is_blacklisted(normalized):
+            return "bad"
+        if self.is_whitelisted(normalized):
+            return "good"
+        return "unknown"
+
+    def add_good(self, value: str, reason: str = "", source: str = "manual") -> str:
+        entry = _normalize_network(value)
+        self._upsert(entry, "good", reason, source)
+        return entry
+
+    def add_bad(self, value: str, reason: str = "", source: str = "manual") -> bool:
+    
+        try:
+            entry = _normalize_network(value)
+        except ValueError:
+            return False
+        try:
+            sample_ip = str(next(ipaddress.ip_network(entry, strict=False).hosts()))
+        except StopIteration:
+            sample_ip = entry.split("/", 1)[0]
+        if self.is_protected(sample_ip):
+            return False
+        self._upsert(entry, "bad", reason, source)
+        return True
+
+    def remove_good(self, value: str) -> None:
+        self._delete(_normalize_network(value), "good")
+
+    def remove_bad(self, value: str) -> None:
+        self._delete(_normalize_network(value), "bad")
+
+    def _upsert(self, entry: str, kind: str, reason: str, source: str) -> None:
+        now = dt.datetime.now().astimezone().isoformat()
+        self._connection.execute(
+            """
+            INSERT INTO reputation (entry, kind, reason, source, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(entry, kind) DO UPDATE SET
+                reason = excluded.reason,
+                source = excluded.source,
+                created_at = excluded.created_at
+            """,
+            (entry, kind, reason, source, now),
+        )
+        self._connection.commit()
+
+    def _delete(self, entry: str, kind: str) -> None:
+        self._connection.execute(
+            "DELETE FROM reputation WHERE entry = ? AND kind = ?", (entry, kind)
+        )
+        self._connection.commit()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "good": [dict(row) for row in self._rows("good")],
+            "bad": [dict(row) for row in self._rows("bad")],
+            "protected": {
+                "admin_ips": sorted(self._admin_ips),
+                "local_ips": sorted(self._local_ips),
+                "critical_ips": sorted(self._critical_ips),
+            },
+            "config_whitelist": list(self._good_networks),
+            "config_blacklist": list(self._bad_networks),
+        }
+
+    def close(self) -> None:
+        self._connection.close()
 
 class JsonlEventLogger:
     def __init__(self, path: str | Path) -> None:
@@ -224,6 +604,234 @@ class JsonlEventLogger:
             handle.write(line + "\n")
             handle.flush()
 
+
+@dataclass
+class MonitorState:
+    path: str
+    inode: int
+    device: int
+    offset: int
+    last_timestamp: str | None = None
+    updated_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> MonitorState:
+        return cls(
+            path=str(value["path"]),
+            inode=int(value["inode"]),
+            device=int(value["device"]),
+            offset=max(0, int(value["offset"])),
+            last_timestamp=value.get("last_timestamp"),
+            updated_at=value.get("updated_at"),
+        )
+
+
+class MonitorStateStore:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def load(self) -> MonitorState | None:
+        if not self.path.exists():
+            return None
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            return MonitorState.from_dict(value)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            LOGGER.warning("Ignoring invalid monitor state at %s", self.path)
+            return None
+
+    def save(self, state: MonitorState) -> None:
+        state.updated_at = dt.datetime.now().astimezone().isoformat()
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        payload = json.dumps(state.to_dict(), sort_keys=True)
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, self.path)
+
+
+class LogMonitor:
+    def __init__(
+        self,
+        path: str | Path,
+        parser: LogParser,
+        state_store: MonitorStateStore,
+        on_event: Callable[[AuthEvent], None],
+        from_end: bool = False,
+        poll_interval: float = 1.0,
+        read_chunk_size: int = 65536,
+        max_partial_bytes: int = 1048576,
+    ) -> None:
+        self.path = Path(path)
+        self.parser = parser
+        self.state_store = state_store
+        self.on_event = on_event
+        self.from_end = from_end
+        self.poll_interval = max(0.05, poll_interval)
+        self.read_chunk_size = max(1, read_chunk_size)
+        self.max_partial_bytes = max(4096, max_partial_bytes)
+        self._handle: BinaryIO | None = None
+        self._buffer = bytearray()
+        self._processed_offset = 0
+        self._read_position = 0
+        self._identity: tuple[int, int] | None = None
+        self._last_timestamp: str | None = None
+        self._started = False
+
+    def start(self) -> None:
+        stat = self.path.stat()
+        saved = self.state_store.load()
+        offset = 0
+        if (
+            saved is not None
+            and saved.path == str(self.path)
+            and saved.inode == stat.st_ino
+            and saved.device == stat.st_dev
+            and saved.offset <= stat.st_size
+        ):
+            offset = saved.offset
+            self._last_timestamp = saved.last_timestamp
+            LOGGER.info("Resuming %s at byte %d", self.path, offset)
+        elif saved is not None:
+            LOGGER.warning("Log rotated while stopped; starting %s at byte 0", self.path)
+        elif self.from_end:
+            offset = stat.st_size
+
+        self._open_at(offset)
+        self._started = True
+        self._save_state(force=True)
+
+    def _open(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+        self._handle = self.path.open("rb", buffering=0)
+        stat = os.fstat(self._handle.fileno())
+        self._identity = (stat.st_dev, stat.st_ino)
+
+    def _open_at(self, offset: int) -> None:
+        self._open()
+        assert self._handle is not None
+        self._handle.seek(offset)
+        self._processed_offset = offset
+        self._read_position = offset
+        self._buffer.clear()
+
+    def _save_state(self, force: bool = False) -> None:
+        if self._identity is None:
+            return
+        if not force and self._handle is None:
+            return
+        state = MonitorState(
+            path=str(self.path),
+            inode=self._identity[1],
+            device=self._identity[0],
+            offset=self._processed_offset,
+            last_timestamp=self._last_timestamp,
+        )
+        self.state_store.save(state)
+
+    def _process_line(self, raw: bytes) -> None:
+        text = raw.decode("utf-8", errors="replace")
+        if not text.strip():
+            return
+        event = self.parser.parse_line(text)
+        if event is None:
+            return
+        self._last_timestamp = event.timestamp.isoformat()
+        try:
+            self.on_event(event)
+        except Exception:
+            LOGGER.exception("Event handler failed for a parsed SSH event")
+
+    def _flush_partial(self) -> None:
+        if not self._buffer:
+            return
+        raw = bytes(self._buffer)
+        self._buffer.clear()
+        self._processed_offset += len(raw)
+        self._process_line(raw)
+
+    def _drain(self) -> bool:
+        if self._handle is None:
+            return False
+        changed = False
+        while True:
+            data = self._handle.read(self.read_chunk_size)
+            if not data:
+                break
+            self._buffer.extend(data)
+            self._read_position = self._handle.tell()
+            changed = True
+            while True:
+                newline = self._buffer.find(b"\n")
+                if newline < 0:
+                    break
+                raw = bytes(self._buffer[:newline])
+                del self._buffer[: newline + 1]
+                line_size = newline + 1
+                self._process_line(raw)
+                self._processed_offset += line_size
+            if len(self._buffer) > self.max_partial_bytes:
+                LOGGER.warning("Discarding oversized partial log line from %s", self.path)
+                self._buffer.clear()
+                self._processed_offset = self._read_position
+        return changed
+
+    def _handle_rotation(self) -> bool:
+        self._drain()
+        self._flush_partial()
+        self._save_state(force=True)
+        LOGGER.info("Log rotation detected for %s", self.path)
+        self._open_at(0)
+        return True
+
+    def poll_once(self) -> bool:
+        if not self._started:
+            self.start()
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return False
+        if self._identity != (stat.st_dev, stat.st_ino):
+            changed = self._handle_rotation()
+        else:
+            if self._handle is None:
+                self._open_at(self._processed_offset)
+            if stat.st_size < self._read_position:
+                LOGGER.info("Log truncation detected for %s", self.path)
+                if self._handle is not None:
+                    self._handle.close()
+                self._open_at(0)
+                changed = True
+            else:
+                changed = False
+        changed = self._drain() or changed
+        if changed:
+            self._save_state()
+        return changed
+
+    def run_forever(self, tick: Callable[[], None] | None = None) -> None:
+        if not self._started:
+            self.start()
+        while True:
+            self.poll_once()
+            if tick is not None:
+                tick()
+            time.sleep(self.poll_interval)
+
+    def stop(self) -> None:
+        if self._handle is not None:
+            self._drain()
+            self._flush_partial()
+            self._save_state(force=True)
+            self._handle.close()
+            self._handle = None
+        self._started = False
 
 def iter_log_lines(path: str | Path) -> Iterable[str]:
     source = Path(path)
